@@ -9,13 +9,13 @@ publish = false
 # and salvo as your web-framework.
 [dependencies]
 askama = { version = "0.14.0", path = "../../askama" }
-salvo = { version = "0.76.0", default-features = false, features = ["http1", "logging", "server"] }
+salvo = { version = "0.78.0", default-features = false, features = ["http1", "logging", "server"] }
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread"] }
 
 # serde and strum are used to parse (deserialize) and generate (serialize) information
 # between web requests, e.g. to share the selected display language.
 serde = { version = "1.0.217", features = ["derive"] }
-strum = { version = "0.26.3", features = ["derive"] }
+strum = { version = "0.27.1", features = ["derive"] }
 
 # These depenendies are simply used for a better user experience, having access logs in the
 # console, and error messages if anything goes wrong, e.g. if the port is already in use.

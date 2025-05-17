@@ -24,10 +24,10 @@ harness = false
 memchr = "2"
 serde = { version = "1.0", optional = true }
 serde_derive = { version = "1.0", optional = true }
-winnow = "0.7.0"
+winnow = { version = "0.7.0", features = ["simd"] }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.6"
 
 [features]
 config = ["dep:serde", "dep:serde_derive"]

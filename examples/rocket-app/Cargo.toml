@@ -13,7 +13,7 @@ rocket = "0.5.1"
 
 # strum is used to parse and serialize information between web requests,
 # e.g. to share the selected display language.
-strum = { version = "0.26.3", features = ["derive"] }
+strum = { version = "0.27.1", features = ["derive"] }
 
 # These depenendies are simply used for a better user experience, having access logs in the
 # console, and error messages if anything goes wrong, e.g. if the port is already in use.
