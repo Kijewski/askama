@@ -96,7 +96,7 @@ struct SmallSelf3 {
 #[derive(Template)]
 #[template(
     ext = "",
-    source = "{{\u{c}KK3e331<c7}}61/63m3333u7<c0.}}\u{6}\0\u{c}\u{c}{{c/crate<338<c7}}6unsafe/63a3ae\u{c}\u{c}\u{c}%et"
+    source = "{{\u{c}KK3e331<c7}}61/63m3333u7<c0.}}\u{6}\0\u{c}\u{c}{{c/crate<338}}6unsafe/63a3ae\u{c}\u{c}\u{c}%et"
 )]
 struct Regression {}
 

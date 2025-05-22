@@ -280,7 +280,33 @@ impl<'a> Expr<'a> {
 
     expr_prec_layer!(or, and, "||");
     expr_prec_layer!(and, compare, "&&");
-    expr_prec_layer!(compare, bor, alt(("==", "!=", ">=", ">", "<=", "<",)));
+
+    fn compare(i: &mut &'a str, level: Level<'_>) -> ParseResult<'a, WithSpan<'a, Self>> {
+        let right = |i: &mut _| {
+            let op = alt(("==", "!=", ">=", ">", "<=", "<"));
+            (ws(op), |i: &mut _| Self::bor(i, level)).parse_next(i)
+        };
+
+        let start = *i;
+        let expr = Self::bor(i, level)?;
+        let Some((op, rhs)) = opt(right).parse_next(i)? else {
+            return Ok(expr);
+        };
+        let expr = WithSpan::new(Self::BinOp(op, Box::new(expr), Box::new(rhs)), start);
+
+        if let Some((op2, _)) = opt(right).parse_next(i)? {
+            return Err(winnow::error::ErrMode::Cut(ErrorContext::new(
+                format!(
+                    "comparison operators cannot be chained; \
+                    consider using explicit parentheses, e.g.  `(_ {op} _) {op2} _`"
+                ),
+                op,
+            )));
+        }
+
+        Ok(expr)
+    }
+
     expr_prec_layer!(bor, bxor, "bitor".value("|"));
     expr_prec_layer!(bxor, band, token_xor);
     expr_prec_layer!(band, shifts, token_bitand);

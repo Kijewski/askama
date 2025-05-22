@@ -1,0 +1,31 @@
+error: comparison operators cannot be chained; consider using explicit parentheses, e.g.  `(_ == _) != _`
+ --> <source attribute>:1:5
+       "== b != c }}"
+ --> tests/ui/comparator-chaining.rs:4:34
+  |
+4 | #[template(ext = "txt", source = "{{ a == b != c }}")]
+  |                                  ^^^^^^^^^^^^^^^^^^^
+
+error: comparison operators cannot be chained; consider using explicit parentheses, e.g.  `(_ <= _) < _`
+ --> <source attribute>:1:5
+       "<= b < c }}"
+  --> tests/ui/comparator-chaining.rs:12:34
+   |
+12 | #[template(ext = "txt", source = "{{ a <= b < c }}")]
+   |                                  ^^^^^^^^^^^^^^^^^^
+
+error: comparison operators cannot be chained; consider using explicit parentheses, e.g.  `(_ == _) == _`
+ --> <source attribute>:1:19
+       "== d == e }}"
+  --> tests/ui/comparator-chaining.rs:20:34
+   |
+20 | #[template(ext = "txt", source = "{{ ((a == b) == c) == d == e }}")]
+   |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: comparison operators cannot be chained; consider using explicit parentheses, e.g.  `(_ == _) == _`
+ --> <source attribute>:1:17
+       "== d == e)) }}"
+  --> tests/ui/comparator-chaining.rs:30:34
+   |
+30 | #[template(ext = "txt", source = "{{ a == (b == (c == d == e)) }}")]
+   |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

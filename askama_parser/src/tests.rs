@@ -605,35 +605,6 @@ fn test_associativity() {
             ))
         )],
     );
-    assert_eq!(
-        Ast::from_str("{{ a == b != c > d > e == f }}", None, &syntax)
-            .unwrap()
-            .nodes,
-        vec![Node::Expr(
-            Ws(None, None),
-            WithSpan::no_span(Expr::BinOp(
-                "==",
-                Box::new(WithSpan::no_span(Expr::BinOp(
-                    ">",
-                    Box::new(WithSpan::no_span(Expr::BinOp(
-                        ">",
-                        Box::new(WithSpan::no_span(Expr::BinOp(
-                            "!=",
-                            Box::new(WithSpan::no_span(Expr::BinOp(
-                                "==",
-                                Box::new(WithSpan::no_span(Expr::Var("a"))),
-                                Box::new(WithSpan::no_span(Expr::Var("b")))
-                            ))),
-                            Box::new(WithSpan::no_span(Expr::Var("c")))
-                        ))),
-                        Box::new(WithSpan::no_span(Expr::Var("d")))
-                    ))),
-                    Box::new(WithSpan::no_span(Expr::Var("e")))
-                ))),
-                Box::new(WithSpan::no_span(Expr::Var("f")))
-            ))
-        )],
-    );
 }
 
 #[test]
@@ -1422,4 +1393,27 @@ fn there_is_no_digit_two_in_a_binary_integer() {
     assert!(Ast::from_str("{{ 0b2 }}", None, &syntax).is_err());
     assert!(Ast::from_str("{{ 0o9 }}", None, &syntax).is_err());
     assert!(Ast::from_str("{{ 0xg }}", None, &syntax).is_err());
+}
+
+#[test]
+fn comparison_operators_cannot_be_chained() {
+    const OPS: &[&str] = &["==", "!=", ">=", ">", "<=", "<"];
+
+    let syntax = Syntax::default();
+    for op1 in OPS {
+        assert!(Ast::from_str(&format!("{{{{ a {op1} b }}}}"), None, &syntax).is_ok());
+        for op2 in OPS {
+            assert!(Ast::from_str(&format!("{{{{ a {op1} b {op2} c }}}}"), None, &syntax).is_err());
+            for op3 in OPS {
+                assert!(
+                    Ast::from_str(
+                        &format!("{{{{ a {op1} b {op2} c {op3} d }}}}"),
+                        None,
+                        &syntax,
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
 }

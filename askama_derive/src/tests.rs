@@ -1225,3 +1225,17 @@ fn fuzzed_0b85() -> Result<(), syn::Error> {
     let _: syn::File = syn::parse2(output)?;
     Ok(())
 }
+
+#[test]
+fn fuzzed_comparator_chain() -> Result<(), syn::Error> {
+    let input = quote! {
+        #[template(
+            ext = "",
+            source = "\u{c}{{vu7218/63e3666663-666/3330e633/63e3666663666/3333<c\"}\u{1}2}\0\"<c7}}2\"\"\"\"\0\0\0\0"
+        )]
+        enum fff {}
+    };
+    let output = crate::derive_template(input, import_askama);
+    let _: syn::File = syn::parse2(output)?;
+    Ok(())
+}
