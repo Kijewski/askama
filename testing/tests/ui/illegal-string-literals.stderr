@@ -141,3 +141,27 @@ error: unicode escape must not be a surrogate
     |
 102 | #[template(ext = "txt", source = r#"{{ c"hello \u{de09} world" }}"#)]
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: a bare CR not allowed in string literals, use NL (Unix linebreak) or CRNL (Windows linebreak) instead, or type `\r` explicitly
+ --> <source attribute>:1:4
+       "hello \r world\" }}"
+   --> tests/ui/illegal-string-literals.rs:109:34
+    |
+109 | #[template(ext = "txt", source = "{{ \"hello \r world\" }}")]
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: a bare CR not allowed in string literals, use NL (Unix linebreak) or CRNL (Windows linebreak) instead, or type `\r` explicitly
+ --> <source attribute>:1:5
+       "hello \r world\" }}"
+   --> tests/ui/illegal-string-literals.rs:113:34
+    |
+113 | #[template(ext = "txt", source = "{{ b\"hello \r world\" }}")]
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: a bare CR not allowed in string literals, use NL (Unix linebreak) or CRNL (Windows linebreak) instead, or type `\r` explicitly
+ --> <source attribute>:1:5
+       "hello \r world\" }}"
+   --> tests/ui/illegal-string-literals.rs:117:34
+    |
+117 | #[template(ext = "txt", source = "{{ c\"hello \r world\" }}")]
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^

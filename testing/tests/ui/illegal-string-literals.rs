@@ -102,4 +102,19 @@ struct SurrogateLow3;
 #[template(ext = "txt", source = r#"{{ c"hello \u{de09} world" }}"#)]
 struct SurrogateHigh3;
 
+// CR (\r) is only allowed if followed by NL (\n)
+// (regression test for <https://github.com/askama-rs/askama/issues/482>)
+
+#[derive(Template)]
+#[template(ext = "txt", source = "{{ \"hello \r world\" }}")]
+struct UnpairedCr;
+
+#[derive(Template)]
+#[template(ext = "txt", source = "{{ b\"hello \r world\" }}")]
+struct UnpairedCrInBytes;
+
+#[derive(Template)]
+#[template(ext = "txt", source = "{{ c\"hello \r world\" }}")]
+struct UnpairedCrInCstring;
+
 fn main() {}

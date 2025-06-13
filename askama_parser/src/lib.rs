@@ -573,6 +573,7 @@ fn str_lit<'a>(i: &mut &'a str) -> ParseResult<'a, StrLit<'a>> {
             Text(&'a str),
             Close,
             Escape,
+            Cr(bool),
         }
 
         let start = *i;
@@ -583,9 +584,10 @@ fn str_lit<'a>(i: &mut &'a str) -> ParseResult<'a, StrLit<'a>> {
 
         while !i.is_empty() {
             let seq = alt((
-                repeat::<_, _, (), _, _>(1.., none_of(['\\', '"']))
+                repeat::<_, _, (), _, _>(1.., none_of(['\r', '\\', '"']))
                     .take()
                     .map(Sequence::Text),
+                preceded('\r', opt('\n')).map(|c| Sequence::Cr(c.is_some())),
                 '\\'.value(Sequence::Escape),
                 peek('"').value(Sequence::Close),
             ))
@@ -597,6 +599,17 @@ fn str_lit<'a>(i: &mut &'a str) -> ParseResult<'a, StrLit<'a>> {
                         contains_unicode_character || s.bytes().any(|c: u8| !c.is_ascii());
                     contains_null = contains_null || s.bytes().any(|c: u8| c == 0);
                     continue;
+                }
+                Sequence::Cr(has_lf) => {
+                    if has_lf {
+                        continue;
+                    } else {
+                        return Err(winnow::error::ErrMode::Cut(ErrorContext::new(
+                            "a bare CR not allowed in string literals, use NL (Unix linebreak) \
+                            or CRNL (Windows linebreak) instead, or type `\\r` explicitly",
+                            start,
+                        )));
+                    }
                 }
                 Sequence::Close => break,
                 Sequence::Escape => {}
