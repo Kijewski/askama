@@ -181,7 +181,7 @@ impl<'a> Generator<'a, '_> {
         Ok(size_hint)
     }
 
-    fn evaluate_condition(
+    pub(super) fn evaluate_condition(
         &self,
         expr: WithSpan<'a, Box<Expr<'a>>>,
         only_contains_is_defined: &mut bool,
@@ -303,6 +303,15 @@ impl<'a> Generator<'a, '_> {
                 } else {
                     EvaluatedResult::AlwaysTrue
                 }
+            }
+            Expr::Conditional(cond) => {
+                // If we can tell the outcome of the condition, recurse.
+                let expr = match self.evaluate_condition(cond.test, only_contains_is_defined) {
+                    EvaluatedResult::AlwaysTrue => cond.then,
+                    EvaluatedResult::AlwaysFalse => cond.otherwise,
+                    EvaluatedResult::Unknown(expr) => return EvaluatedResult::Unknown(expr),
+                };
+                self.evaluate_condition(expr, only_contains_is_defined)
             }
         }
     }
@@ -1363,7 +1372,7 @@ struct Conds<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum EvaluatedResult<'a> {
+pub(super) enum EvaluatedResult<'a> {
     AlwaysTrue,
     AlwaysFalse,
     Unknown(WithSpan<'a, Box<Expr<'a>>>),
@@ -1534,6 +1543,9 @@ fn is_cacheable(expr: &WithSpan<'_, Box<Expr<'_>>>) -> bool {
         Expr::As(expr, _) => is_cacheable(expr),
         Expr::Try(expr) => is_cacheable(expr),
         Expr::Concat(args) => args.iter().all(is_cacheable),
+        Expr::Conditional(cond) => {
+            is_cacheable(&cond.test) && is_cacheable(&cond.then) && is_cacheable(&cond.otherwise)
+        }
         // Doesn't make sense in this context.
         Expr::LetCond(_) => false,
         // We have too little information to tell if the expression is pure:
