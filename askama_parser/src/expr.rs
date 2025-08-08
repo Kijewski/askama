@@ -1,5 +1,3 @@
-use std::str;
-
 use winnow::Parser;
 use winnow::ascii::digit1;
 use winnow::combinator::{
@@ -10,9 +8,9 @@ use winnow::token::{any, one_of, take, take_until};
 
 use crate::node::CondTest;
 use crate::{
-    CharLit, ErrorContext, HashSet, InputStream, Level, Num, ParseResult, PathOrIdentifier, StrLit,
-    StrPrefix, WithSpan, can_be_variable_name, char_lit, cut_error, filter, identifier, keyword,
-    not_suffix_with_hash, num_lit, path_or_identifier, skip_ws0, skip_ws1, str_lit, ws,
+    CharLit, ErrorContext, FileId, HashSet, InputStream, Level, Num, ParseResult, PathOrIdentifier,
+    StrLit, StrPrefix, WithSpan, can_be_variable_name, char_lit, cut_error, filter, identifier,
+    keyword, not_suffix_with_hash, num_lit, path_or_identifier, skip_ws0, skip_ws1, str_lit, ws,
 };
 
 macro_rules! expr_prec_layer {
@@ -20,7 +18,7 @@ macro_rules! expr_prec_layer {
         fn $name(
             i: &mut InputStream<'a>,
             level: Level<'_>,
-        ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
+        ) -> ParseResult<'a, WithSpan<Box<Self>>> {
             expr_prec_layer(i, level, Expr::$inner, |i: &mut _| $op.parse_next(i))
         }
     };
@@ -29,22 +27,23 @@ macro_rules! expr_prec_layer {
 fn expr_prec_layer<'a>(
     i: &mut InputStream<'a>,
     level: Level<'_>,
-    inner: fn(&mut InputStream<'a>, Level<'_>) -> ParseResult<'a, WithSpan<'a, Box<Expr<'a>>>>,
+    inner: fn(&mut InputStream<'a>, Level<'_>) -> ParseResult<'a, WithSpan<Box<Expr<'a>>>>,
     op: fn(&mut InputStream<'a>) -> ParseResult<'a>,
-) -> ParseResult<'a, WithSpan<'a, Box<Expr<'a>>>> {
-    let start = ***i;
+) -> ParseResult<'a, WithSpan<Box<Expr<'a>>>> {
     let mut expr = inner(i, level)?;
 
+    let mut i_before = i.clone();
     let mut level_guard = level.guard();
-    while let Some(((op, rhs), i_before)) =
-        opt((ws(op), |i: &mut _| inner(i, level)).with_taken()).parse_next(i)?
+    while let Some(((op, span), rhs)) =
+        opt((ws(op.with_span()), |i: &mut _| inner(i, level))).parse_next(i)?
     {
-        level_guard.nest(i_before)?;
+        level_guard.nest(&i_before)?;
         expr = WithSpan::new(
             Box::new(Expr::BinOp(BinOp { op, lhs: expr, rhs })),
-            start,
-            i,
+            span,
+            &*i,
         );
+        i_before = i.clone();
     }
 
     Ok(expr)
@@ -56,22 +55,31 @@ struct Allowed {
     super_keyword: bool,
 }
 
-fn check_expr<'a>(expr: &WithSpan<'a, Box<Expr<'a>>>, allowed: Allowed) -> ParseResult<'a, ()> {
+fn check_expr<'a>(expr: &WithSpan<Box<Expr<'a>>>, allowed: Allowed) -> ParseResult<'a, ()> {
     match &*expr.inner {
         &Expr::Var(name) => {
             // List can be found in rust compiler "can_be_raw" function (although in our case, it's
             // also used in cases like `match`, so `self` is allowed in this case).
             if (!allowed.super_keyword && name == "super") || matches!(name, "crate" | "Self") {
-                err_reserved_identifier(name)
+                err_reserved_identifier(&WithSpan {
+                    inner: name,
+                    span: expr.span,
+                })
             } else if !allowed.underscore && name == "_" {
-                err_underscore_identifier(name)
+                err_underscore_identifier(&WithSpan {
+                    inner: name,
+                    span: expr.span,
+                })
             } else {
                 Ok(())
             }
         }
         &Expr::IsDefined(var) | &Expr::IsNotDefined(var) => {
             if var == "_" {
-                err_underscore_identifier(var)
+                err_underscore_identifier(&WithSpan {
+                    inner: var,
+                    span: expr.span,
+                })
             } else {
                 Ok(())
             }
@@ -80,7 +88,10 @@ fn check_expr<'a>(expr: &WithSpan<'a, Box<Expr<'a>>>, allowed: Allowed) -> Parse
             if let [arg] = path.as_slice()
                 && !crate::can_be_variable_name(arg.name)
             {
-                return err_reserved_identifier(arg.name);
+                return err_reserved_identifier(&WithSpan {
+                    inner: arg.name,
+                    span: arg.span,
+                });
             }
             Ok(())
         }
@@ -92,9 +103,15 @@ fn check_expr<'a>(expr: &WithSpan<'a, Box<Expr<'a>>>, allowed: Allowed) -> Parse
         }
         Expr::AssociatedItem(elem, associated_item) => {
             if associated_item.name == "_" {
-                err_underscore_identifier(associated_item.name)
+                err_underscore_identifier(&WithSpan {
+                    inner: associated_item.name,
+                    span: elem.span,
+                })
             } else if !crate::can_be_variable_name(associated_item.name) {
-                err_reserved_identifier(associated_item.name)
+                err_reserved_identifier(&WithSpan {
+                    inner: associated_item.name,
+                    span: elem.span,
+                })
             } else {
                 check_expr(elem, Allowed::default())
             }
@@ -152,19 +169,22 @@ fn check_expr<'a>(expr: &WithSpan<'a, Box<Expr<'a>>>, allowed: Allowed) -> Parse
 }
 
 #[inline(always)]
-fn err_underscore_identifier<T>(name: &str) -> ParseResult<'_, T> {
-    cut_error!("reserved keyword `_` cannot be used here", name)
+fn err_underscore_identifier<'a, T>(name: &WithSpan<&str>) -> ParseResult<'a, T> {
+    cut_error!("reserved keyword `_` cannot be used here", name.span)
 }
 
 #[inline(always)]
-fn err_reserved_identifier<T>(name: &str) -> ParseResult<'_, T> {
-    cut_error!(format!("`{name}` cannot be used as an identifier"), name)
+fn err_reserved_identifier<'a, T>(name: &WithSpan<&str>) -> ParseResult<'a, T> {
+    cut_error!(
+        format!("`{}` cannot be used as an identifier", name.inner),
+        name.span
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PathComponent<'a> {
     pub name: &'a str,
-    pub generics: Vec<WithSpan<'a, TyGenerics<'a>>>,
+    pub generics: Vec<WithSpan<TyGenerics<'a>>>,
 }
 
 impl<'a> PathComponent<'a> {
@@ -178,20 +198,21 @@ impl<'a> PathComponent<'a> {
     pub(crate) fn parse(
         i: &mut InputStream<'a>,
         level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Self>> {
+    ) -> ParseResult<'a, WithSpan<Self>> {
         (
             identifier,
             opt((ws("::"), |i: &mut _| TyGenerics::args(i, level))),
         )
-            .with_taken()
+            .with_span()
             .parse_next(i)
             .map(|((name, generics), span)| {
-                WithSpan::new_with_full(
+                WithSpan::new(
                     Self {
                         name,
                         generics: generics.map(|(_, generics)| generics).unwrap_or_default(),
                     },
                     span,
+                    i,
                 )
             })
     }
@@ -204,28 +225,28 @@ pub enum Expr<'a> {
     StrLit(StrLit<'a>),
     CharLit(CharLit<'a>),
     Var(&'a str),
-    Path(Vec<WithSpan<'a, PathComponent<'a>>>),
-    Array(Vec<WithSpan<'a, Box<Expr<'a>>>>),
-    AssociatedItem(WithSpan<'a, Box<Expr<'a>>>, AssociatedItem<'a>),
-    Index(WithSpan<'a, Box<Expr<'a>>>, WithSpan<'a, Box<Expr<'a>>>),
+    Path(Vec<WithSpan<PathComponent<'a>>>),
+    Array(Vec<WithSpan<Box<Expr<'a>>>>),
+    AssociatedItem(WithSpan<Box<Expr<'a>>>, AssociatedItem<'a>),
+    Index(WithSpan<Box<Expr<'a>>>, WithSpan<Box<Expr<'a>>>),
     Filter(Filter<'a>),
-    As(WithSpan<'a, Box<Expr<'a>>>, &'a str),
-    NamedArgument(&'a str, WithSpan<'a, Box<Expr<'a>>>),
-    Unary(&'a str, WithSpan<'a, Box<Expr<'a>>>),
+    As(WithSpan<Box<Expr<'a>>>, &'a str),
+    NamedArgument(WithSpan<&'a str>, WithSpan<Box<Expr<'a>>>),
+    Unary(&'a str, WithSpan<Box<Expr<'a>>>),
     BinOp(BinOp<'a>),
     Range(Range<'a>),
-    Group(WithSpan<'a, Box<Expr<'a>>>),
-    Tuple(Vec<WithSpan<'a, Box<Expr<'a>>>>),
+    Group(WithSpan<Box<Expr<'a>>>),
+    Tuple(Vec<WithSpan<Box<Expr<'a>>>>),
     Call(Call<'a>),
     RustMacro(Vec<&'a str>, &'a str),
-    Try(WithSpan<'a, Box<Expr<'a>>>),
+    Try(WithSpan<Box<Expr<'a>>>),
     /// This variant should never be used directly. It is created when generating filter blocks.
     FilterSource,
     IsDefined(&'a str),
     IsNotDefined(&'a str),
-    Concat(Vec<WithSpan<'a, Box<Expr<'a>>>>),
+    Concat(Vec<WithSpan<Box<Expr<'a>>>>),
     /// If you have `&& let Some(y)`, this variant handles it.
-    LetCond(WithSpan<'a, CondTest<'a>>),
+    LetCond(WithSpan<CondTest<'a>>),
     /// This variant should never be used directly.
     /// It is used for the handling of named arguments in the generator, esp. with filters.
     ArgumentPlaceholder,
@@ -233,33 +254,31 @@ pub enum Expr<'a> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Call<'a> {
-    pub path: WithSpan<'a, Box<Expr<'a>>>,
-    pub args: Vec<WithSpan<'a, Box<Expr<'a>>>>,
+    pub path: WithSpan<Box<Expr<'a>>>,
+    pub args: Vec<WithSpan<Box<Expr<'a>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Range<'a> {
     pub op: &'a str,
-    pub lhs: Option<WithSpan<'a, Box<Expr<'a>>>>,
-    pub rhs: Option<WithSpan<'a, Box<Expr<'a>>>>,
+    pub lhs: Option<WithSpan<Box<Expr<'a>>>>,
+    pub rhs: Option<WithSpan<Box<Expr<'a>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BinOp<'a> {
     pub op: &'a str,
-    pub lhs: WithSpan<'a, Box<Expr<'a>>>,
-    pub rhs: WithSpan<'a, Box<Expr<'a>>>,
+    pub lhs: WithSpan<Box<Expr<'a>>>,
+    pub rhs: WithSpan<Box<Expr<'a>>>,
 }
 
 impl<'a> Expr<'a> {
     pub(super) fn arguments(
         i: &mut InputStream<'a>,
         level: Level<'_>,
-    ) -> ParseResult<'a, Vec<WithSpan<'a, Box<Self>>>> {
+    ) -> ParseResult<'a, Vec<WithSpan<Box<Self>>>> {
         let _level_guard = level.nest(i)?;
         let mut named_arguments = HashSet::default();
-        let start = ***i;
-
         preceded(
             ws('('),
             cut_err(terminated(
@@ -272,12 +291,12 @@ impl<'a> Expr<'a> {
                         let has_named_arguments = !named_arguments.is_empty();
 
                         let expr = alt((
-                            move |i: &mut _| Self::named_argument(i, level, named_arguments, start),
+                            move |i: &mut _| Self::named_argument(i, level, named_arguments),
                             move |i: &mut _| Self::parse(i, level, false),
                         ))
                         .parse_next(i)?;
-                        if has_named_arguments && !matches!(**expr, Self::NamedArgument(_, _)) {
-                            cut_error!("named arguments must always be passed last", start)
+                        if has_named_arguments && let Self::NamedArgument(name, _) = &**expr {
+                            cut_error!("named arguments must always be passed last", name.span)
                         } else {
                             Ok(expr)
                         }
@@ -294,65 +313,85 @@ impl<'a> Expr<'a> {
         i: &mut InputStream<'a>,
         level: Level<'_>,
         named_arguments: &mut HashSet<&'a str>,
-        start: &'a str,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let ((argument, _, value), span) = (identifier, ws('='), move |i: &mut _| {
-            Self::parse(i, level, false)
-        })
-            .with_taken()
-            .parse_next(i)?;
-        if named_arguments.insert(argument) {
-            Ok(WithSpan::new_with_full(
-                Box::new(Self::NamedArgument(argument, value)),
-                span,
-            ))
-        } else {
-            cut_error!(
-                format!("named argument `{argument}` was passed more than once"),
-                start
-            )
+    ) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let (((argument, arg_span), _, value), span) =
+            (identifier.with_span(), ws('='), move |i: &mut _| {
+                Self::parse(i, level, false)
+            })
+                .with_span()
+                .parse_next(i)?;
+        if !named_arguments.insert(argument) {
+            return cut_error!(
+                format!(
+                    "named argument `{}` was passed more than once",
+                    argument.escape_debug()
+                ),
+                arg_span,
+                i,
+            );
         }
+
+        Ok(WithSpan::new(
+            Box::new(Self::NamedArgument(
+                WithSpan::new(argument, arg_span, &*i),
+                value,
+            )),
+            span,
+            i,
+        ))
     }
 
     pub(super) fn parse(
         i: &mut InputStream<'a>,
         level: Level<'_>,
         allow_underscore: bool,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
+    ) -> ParseResult<'a, WithSpan<Box<Self>>> {
         let _level_guard = level.nest(i)?;
-        let range_right = move |i: &mut _| {
-            (
-                ws(alt(("..=", ".."))),
+        Self::range(i, level, allow_underscore)
+    }
+
+    fn range(
+        i: &mut InputStream<'a>,
+        level: Level<'_>,
+        allow_underscore: bool,
+    ) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let file_id: FileId = FileId::from(&*i);
+
+        let range_right = move |i: &mut InputStream<'a>| {
+            let ((op, span), rhs) = (
+                ws(alt(("..=", "..")).with_span()),
                 opt(move |i: &mut _| Self::or(i, level)),
             )
-                .parse_next(i)
+                .parse_next(i)?;
+            Ok((op, rhs, span))
         };
-        let expr = alt((
-            range_right.with_taken().map(move |((op, right), i)| {
-                WithSpan::new_with_full(
+
+        // `..expr` or `..`
+        let range_to = range_right.map(move |(op, rhs, span)| {
+            WithSpan::new(
+                Box::new(Self::Range(Range { op, lhs: None, rhs })),
+                span,
+                file_id,
+            )
+        });
+
+        // `expr..expr` or `expr..`
+        let range_from = (move |i: &mut _| Self::or(i, level), opt(range_right)).map(
+            move |(lhs, rhs)| match rhs {
+                Some((op, rhs, span)) => WithSpan::new(
                     Box::new(Self::Range(Range {
                         op,
-                        lhs: None,
-                        rhs: right,
+                        lhs: Some(lhs),
+                        rhs,
                     })),
-                    i,
-                )
-            }),
-            (move |i: &mut _| Self::or(i, level), opt(range_right))
-                .with_taken()
-                .map(move |((left, right), i)| match right {
-                    Some((op, right)) => WithSpan::new_with_full(
-                        Box::new(Self::Range(Range {
-                            op,
-                            lhs: Some(left),
-                            rhs: right,
-                        })),
-                        i,
-                    ),
-                    None => left,
-                }),
-        ))
-        .parse_next(i)?;
+                    span,
+                    file_id,
+                ),
+                None => lhs,
+            },
+        );
+
+        let expr = alt((range_to, range_from)).parse_next(i)?;
         check_expr(
             &expr,
             Allowed {
@@ -366,31 +405,31 @@ impl<'a> Expr<'a> {
     expr_prec_layer!(or, and, "||");
     expr_prec_layer!(and, compare, "&&");
 
-    fn compare(
-        i: &mut InputStream<'a>,
-        level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let right = |i: &mut _| {
-            let op = alt(("==", "!=", ">=", ">", "<=", "<"));
-            (ws(op), |i: &mut _| Self::bor(i, level)).parse_next(i)
-        };
+    fn compare(i: &mut InputStream<'a>, level: Level<'_>) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let mut parse_op = ws(alt(("==", "!=", ">=", ">", "<=", "<")).with_span());
 
-        let ((expr, rhs), span) = (|i: &mut _| Self::bor(i, level), opt(right))
-            .with_taken()
+        let (expr, rhs) = (
+            |i: &mut _| Self::bor(i, level),
+            opt((parse_op.by_ref(), |i: &mut _| Self::bor(i, level))),
+        )
             .parse_next(i)?;
-        let Some((op, rhs)) = rhs else {
+        let Some(((op, span), rhs)) = rhs else {
             return Ok(expr);
         };
-        let expr =
-            WithSpan::new_with_full(Box::new(Expr::BinOp(BinOp { op, lhs: expr, rhs })), span);
+        let expr = WithSpan::new(
+            Box::new(Expr::BinOp(BinOp { op, lhs: expr, rhs })),
+            span,
+            &*i,
+        );
 
-        if let Some((op2, _)) = opt(right).parse_next(i)? {
+        if let Some((op2, span)) = opt(parse_op).parse_next(i)? {
             return cut_error!(
                 format!(
                     "comparison operators cannot be chained; \
                     consider using explicit parentheses, e.g.  `(_ {op} _) {op2} _`"
                 ),
-                op,
+                span,
+                i,
             );
         }
 
@@ -403,40 +442,37 @@ impl<'a> Expr<'a> {
     expr_prec_layer!(shifts, addsub, alt((">>", "<<")));
     expr_prec_layer!(addsub, concat, alt(("+", "-")));
 
-    fn concat(
-        i: &mut InputStream<'a>,
-        level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
+    fn concat(i: &mut InputStream<'a>, level: Level<'_>) -> ParseResult<'a, WithSpan<Box<Self>>> {
         fn concat_expr<'a>(
             i: &mut InputStream<'a>,
             level: Level<'_>,
-        ) -> ParseResult<'a, Option<WithSpan<'a, Box<Expr<'a>>>>> {
+        ) -> ParseResult<'a, Option<(WithSpan<Box<Expr<'a>>>, std::ops::Range<usize>)>> {
             let ws1 = |i: &mut _| opt(skip_ws1).parse_next(i);
+            let tilde = (ws1, '~', ws1).with_span();
+            let data = opt((tilde, |i: &mut _| Expr::muldivmod(i, level))).parse_next(i)?;
 
-            let start = ***i;
-            let data = opt((ws1, '~', ws1, |i: &mut _| Expr::muldivmod(i, level))).parse_next(i)?;
-            if let Some((t1, _, t2, expr)) = data {
-                if t1.is_none() || t2.is_none() {
-                    return cut_error!(
-                        "the concat operator `~` must be surrounded by spaces",
-                        start,
-                    );
-                }
-                Ok(Some(expr))
-            } else {
-                Ok(None)
+            let Some((((t1, _, t2), span), expr)) = data else {
+                return Ok(None);
+            };
+            if t1.is_none() || t2.is_none() {
+                return cut_error!(
+                    "the concat operator `~` must be surrounded by spaces",
+                    span,
+                    i,
+                );
             }
+
+            Ok(Some((expr, span)))
         }
 
-        let start = ***i;
         let expr = Self::muldivmod(i, level)?;
         let expr2 = concat_expr(i, level)?;
-        if let Some(expr2) = expr2 {
+        if let Some((expr2, span)) = expr2 {
             let mut exprs = vec![expr, expr2];
-            while let Some(expr) = concat_expr(i, level)? {
+            while let Some((expr, _)) = concat_expr(i, level)? {
                 exprs.push(expr);
             }
-            Ok(WithSpan::new(Box::new(Self::Concat(exprs)), start, i))
+            Ok(WithSpan::new(Box::new(Self::Concat(exprs)), span, i))
         } else {
             Ok(expr)
         }
@@ -444,50 +480,29 @@ impl<'a> Expr<'a> {
 
     expr_prec_layer!(muldivmod, is_as, alt(("*", "/", "%")));
 
-    fn is_as(
-        i: &mut InputStream<'a>,
-        level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let start = ***i;
+    fn is_as(i: &mut InputStream<'a>, level: Level<'_>) -> ParseResult<'a, WithSpan<Box<Self>>> {
         let lhs = Self::filtered(i, level)?;
-        let before_keyword = *i;
-        let rhs = opt(ws(identifier)).parse_next(i)?;
+        let checkpoint = i.checkpoint();
+        let rhs = opt(ws(identifier.with_span())).parse_next(i)?;
         match rhs {
-            Some("is") => {}
-            Some("as") => {
-                let target = opt(identifier).parse_next(i)?;
-                let target = target.unwrap_or_default();
-                if crate::PRIMITIVE_TYPES.contains(&target) {
-                    return Ok(WithSpan::new(Box::new(Self::As(lhs, target)), start, i));
-                } else if target.is_empty() {
-                    return cut_error!(
-                        "`as` operator expects the name of a primitive type on its right-hand side",
-                        before_keyword.trim_start(),
-                    );
-                } else {
-                    return cut_error!(
-                        format!(
-                            "`as` operator expects the name of a primitive type on its right-hand \
-                              side, found `{target}`"
-                        ),
-                        before_keyword.trim_start(),
-                    );
-                }
-            }
+            Some(("is", span)) => Self::is_as_handle_is(i, lhs, span),
+            Some(("as", span)) => Self::is_as_handle_as(i, level, lhs, span),
             _ => {
-                *i = before_keyword;
-                return Ok(lhs);
+                i.reset(&checkpoint);
+                Ok(lhs)
             }
         }
+    }
 
-        let rhs = opt(terminated(opt(keyword("not")), ws(keyword("defined")))).parse_next(i)?;
-        let ctor = match rhs {
+    fn is_as_handle_is(
+        i: &mut InputStream<'a>,
+        lhs: WithSpan<Box<Expr<'a>>>,
+        span: std::ops::Range<usize>,
+    ) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let mut rhs = opt(terminated(opt(keyword("not")), ws(keyword("defined"))));
+        let ctor = match rhs.parse_next(i)? {
             None => {
-                return cut_error!(
-                    "expected `defined` or `not defined` after `is`",
-                    // We use `start` to show the whole `var is` thing instead of the current token.
-                    start,
-                );
+                return cut_error!("expected `defined` or `not defined` after `is`", span, i,);
             }
             Some(None) => Self::IsDefined,
             Some(Some(_)) => Self::IsNotDefined,
@@ -497,65 +512,96 @@ impl<'a> Expr<'a> {
             Self::AssociatedItem(_, _) => {
                 return cut_error!(
                     "`is defined` operator can only be used on variables, not on their fields",
-                    start,
+                    span,
+                    i,
                 );
             }
             _ => {
-                return cut_error!("`is defined` operator can only be used on variables", start);
+                return cut_error!(
+                    "`is defined` operator can only be used on variables",
+                    span,
+                    i
+                );
             }
         };
-        Ok(WithSpan::new(Box::new(ctor(var_name)), start, i))
+        Ok(WithSpan::new(Box::new(ctor(var_name)), span, i))
     }
 
-    fn filtered(
+    fn is_as_handle_as(
         i: &mut InputStream<'a>,
         level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
+        lhs: WithSpan<Box<Expr<'a>>>,
+        span: std::ops::Range<usize>,
+    ) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let target = opt(|i: &mut _| path_or_identifier(i, level)).parse_next(i)?;
+        let Some(PathOrIdentifier::Identifier(target)) = target else {
+            return cut_error!(
+                "`as` operator expects the name of a primitive type on its right-hand side, \
+                not a path or alias",
+                span,
+                i,
+            );
+        };
+
+        if crate::PRIMITIVE_TYPES.contains(&target) {
+            return Ok(WithSpan::new(Box::new(Self::As(lhs, target)), span, i));
+        } else if target.is_empty() {
+            return cut_error!(
+                "`as` operator expects the name of a primitive type on its right-hand side",
+                span,
+                i,
+            );
+        } else {
+            return cut_error!(
+                format!(
+                    "`as` operator expects the name of a primitive type on its right-hand \
+                    side, found `{}`",
+                    target.escape_debug()
+                ),
+                span,
+                i,
+            );
+        }
+    }
+
+    fn filtered(i: &mut InputStream<'a>, level: Level<'_>) -> ParseResult<'a, WithSpan<Box<Self>>> {
         let mut res = Self::prefix(i, level)?;
 
         let mut level_guard = level.guard();
-        let mut start = ***i;
-        while let Some((mut filter, i_before)) =
-            opt(ws((|i: &mut _| filter(i, level)).with_taken())).parse_next(i)?
+        let mut i_before = i.clone();
+        while let Some((mut filter, span)) =
+            opt(ws((|i: &mut _| filter(i, level)).with_span())).parse_next(i)?
         {
-            level_guard.nest(i_before)?;
+            level_guard.nest(&i_before)?;
             filter.arguments.insert(0, res);
-            res = WithSpan::new(Box::new(Self::Filter(filter)), start.trim_start(), i);
-            start = ***i;
+            res = WithSpan::new(Box::new(Self::Filter(filter)), span, &*i);
+            i_before = i.clone();
         }
         Ok(res)
     }
 
-    fn prefix(
-        i: &mut InputStream<'a>,
-        level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let start = ***i;
-
+    fn prefix(i: &mut InputStream<'a>, level: Level<'_>) -> ParseResult<'a, WithSpan<Box<Self>>> {
         // This is a rare place where we create recursion in the parsed AST
         // without recursing the parser call stack. However, this can lead
         // to stack overflows in drop glue when the AST is very deep.
         let mut level_guard = level.guard();
+        let mut i_before = i.clone();
         let mut ops = vec![];
-        while let Some((op, i_before)) =
-            opt(ws(alt(("!", "-", "*", "&")).with_taken())).parse_next(i)?
-        {
-            level_guard.nest(i_before)?;
+        while let Some(op) = opt(ws(alt(("!", "-", "*", "&")).with_span())).parse_next(i)? {
+            level_guard.nest(&i_before)?;
             ops.push(op);
+            i_before = i.clone();
         }
 
         let mut expr = Suffix::parse(i, level)?;
-        for op in ops.iter().rev() {
-            expr = WithSpan::new(Box::new(Self::Unary(op, expr)), start, i);
+        for (op, span) in ops.into_iter().rev() {
+            expr = WithSpan::new(Box::new(Self::Unary(op, expr)), span, &*i);
         }
 
         Ok(expr)
     }
 
-    fn single(
-        i: &mut InputStream<'a>,
-        level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
+    fn single(i: &mut InputStream<'a>, level: Level<'_>) -> ParseResult<'a, WithSpan<Box<Self>>> {
         alt((
             Self::num,
             Self::str,
@@ -567,11 +613,8 @@ impl<'a> Expr<'a> {
         .parse_next(i)
     }
 
-    fn group(
-        i: &mut InputStream<'a>,
-        level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        ws('(').parse_next(i)?;
+    fn group(i: &mut InputStream<'a>, level: Level<'_>) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        (skip_ws0, peek('(')).parse_next(i)?;
         Self::group_actually(i, level)
     }
 
@@ -580,11 +623,13 @@ impl<'a> Expr<'a> {
     fn group_actually(
         i: &mut InputStream<'a>,
         level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let (expr, span) = cut_err(|i: &mut _| Self::group_actually_inner(i, level))
-            .with_taken()
-            .parse_next(i)?;
-        Ok(WithSpan::new_with_full(expr, span.trim_ascii()))
+    ) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let (expr, span) = cut_err(preceded('(', |i: &mut _| {
+            Self::group_actually_inner(i, level)
+        }))
+        .with_span()
+        .parse_next(i)?;
+        Ok(WithSpan::new(expr, span, i))
     }
 
     #[inline]
@@ -592,39 +637,28 @@ impl<'a> Expr<'a> {
         i: &mut InputStream<'a>,
         level: Level<'_>,
     ) -> ParseResult<'a, Box<Self>> {
-        enum GroupResult<'a> {
-            Tuple(WithSpan<'a, Box<Expr<'a>>>),
-            Expr(Box<Expr<'a>>),
-            Err(&'static str),
-        }
-
         let (expr, comma, closing) = (
             opt(|i: &mut _| Self::parse(i, level, true)),
-            ws(opt(','.take())),
+            ws(opt(','.span())),
             opt(')'),
         )
             .parse_next(i)?;
 
-        let result = match (expr, comma, closing) {
+        let expr = match (expr, comma, closing) {
             // `(expr,`
-            (Some(expr), Some(_), None) => GroupResult::Tuple(expr),
+            (Some(expr), Some(_), None) => expr,
             // `()`
-            (None, None, Some(_)) => GroupResult::Expr(Box::new(Self::Tuple(vec![]))),
+            (None, None, Some(_)) => return Ok(Box::new(Self::Tuple(vec![]))),
             // `(expr)`
-            (Some(expr), None, Some(_)) => GroupResult::Expr(Box::new(Self::Group(expr))),
+            (Some(expr), None, Some(_)) => return Ok(Box::new(Self::Group(expr))),
             // `(expr,)`
-            (Some(expr), Some(_), Some(_)) => GroupResult::Expr(Box::new(Self::Tuple(vec![expr]))),
+            (Some(expr), Some(_), Some(_)) => return Ok(Box::new(Self::Tuple(vec![expr]))),
             // `(`
-            (None, None, None) => GroupResult::Err("expected closing `)` or an expression"),
+            (None, None, None) => return cut_error!("expected closing `)` or an expression", *i),
             // `(expr`
-            (Some(_), None, None) => GroupResult::Err("expected `,` or `)`"),
+            (Some(_), None, None) => return cut_error!("expected `,` or `)`", *i),
             // `(,`
-            (None, Some(span), _) => return cut_error!("stray comma after opening `(`", span),
-        };
-        let expr = match result {
-            GroupResult::Tuple(expr) => expr,
-            GroupResult::Expr(expr) => return Ok(expr),
-            GroupResult::Err(msg) => return cut_error!(msg, ***i),
+            (None, Some(span), _) => return cut_error!("stray comma after opening `(`", span, i),
         };
 
         let mut exprs = vec![expr];
@@ -639,7 +673,7 @@ impl<'a> Expr<'a> {
         .map(|()| ()));
 
         let ((items, comma, close), span) = cut_err((collect_items, ws(opt(',')), opt(')')))
-            .with_taken()
+            .with_span()
             .parse_next(i)?;
         let msg = if items.is_none() {
             "expected `)` or an expression"
@@ -650,15 +684,11 @@ impl<'a> Expr<'a> {
         } else {
             "expected `,` or `)`"
         };
-        cut_error!(msg, span)
+        cut_error!(msg, span, i)
     }
 
-    fn array(
-        i: &mut InputStream<'a>,
-        level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let start = ***i;
-        let array = preceded(
+    fn array(i: &mut InputStream<'a>, level: Level<'_>) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let (array, span) = preceded(
             ws('['),
             cut_err(terminated(
                 opt(terminated(
@@ -668,10 +698,11 @@ impl<'a> Expr<'a> {
                 ']',
             )),
         )
+        .with_span()
         .parse_next(i)?;
         Ok(WithSpan::new(
             Box::new(Self::Array(array.unwrap_or_default())),
-            start,
+            span,
             i,
         ))
     }
@@ -679,33 +710,32 @@ impl<'a> Expr<'a> {
     fn path_var_bool(
         i: &mut InputStream<'a>,
         level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let start = ***i;
-        let ret = match path_or_identifier(i, level)? {
+    ) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let (ret, span) = (|i: &mut _| path_or_identifier(i, level))
+            .with_span()
+            .parse_next(i)?;
+        let ret = match ret {
             PathOrIdentifier::Path(v) => Box::new(Self::Path(v)),
             PathOrIdentifier::Identifier("true") => Box::new(Self::BoolLit(true)),
             PathOrIdentifier::Identifier("false") => Box::new(Self::BoolLit(false)),
             PathOrIdentifier::Identifier(v) => Box::new(Self::Var(v)),
         };
-        Ok(WithSpan::new(ret, start, i))
+        Ok(WithSpan::new(ret, span, i))
     }
 
-    fn str(i: &mut InputStream<'a>) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let start = ***i;
-        let s = str_lit.parse_next(i)?;
-        Ok(WithSpan::new(Box::new(Self::StrLit(s)), start, i))
+    fn str(i: &mut InputStream<'a>) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let (s, span) = str_lit.with_span().parse_next(i)?;
+        Ok(WithSpan::new(Box::new(Self::StrLit(s)), span, i))
     }
 
-    fn num(i: &mut InputStream<'a>) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let start = ***i;
-        let (num, full) = num_lit.with_taken().parse_next(i)?;
-        Ok(WithSpan::new(Box::new(Expr::NumLit(full, num)), start, i))
+    fn num(i: &mut InputStream<'a>) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let ((num, full), span) = num_lit.with_taken().with_span().parse_next(i)?;
+        Ok(WithSpan::new(Box::new(Expr::NumLit(full, num)), span, i))
     }
 
-    fn char(i: &mut InputStream<'a>) -> ParseResult<'a, WithSpan<'a, Box<Self>>> {
-        let start = ***i;
-        let c = char_lit.parse_next(i)?;
-        Ok(WithSpan::new(Box::new(Self::CharLit(c)), start, i))
+    fn char(i: &mut InputStream<'a>) -> ParseResult<'a, WithSpan<Box<Self>>> {
+        let (c, span) = char_lit.with_span().parse_next(i)?;
+        Ok(WithSpan::new(Box::new(Self::CharLit(c)), span, i))
     }
 
     #[must_use]
@@ -742,27 +772,35 @@ impl<'a> Expr<'a> {
 }
 
 fn token_xor<'a>(i: &mut InputStream<'a>) -> ParseResult<'a> {
-    let good = alt((keyword("xor").value(true), '^'.value(false))).parse_next(i)?;
+    let (good, span) = alt((keyword("xor").value(true), '^'.value(false)))
+        .with_span()
+        .parse_next(i)?;
     if good {
         Ok("^")
     } else {
-        cut_error!("the binary XOR operator is called `xor` in askama", ***i)
+        cut_error!("the binary XOR operator is called `xor` in askama", span, i)
     }
 }
 
 fn token_bitand<'a>(i: &mut InputStream<'a>) -> ParseResult<'a> {
-    let good = alt((keyword("bitand").value(true), ('&', not('&')).value(false))).parse_next(i)?;
+    let (good, span) = alt((keyword("bitand").value(true), ('&', not('&')).value(false)))
+        .with_span()
+        .parse_next(i)?;
     if good {
         Ok("&")
     } else {
-        cut_error!("the binary AND operator is called `bitand` in askama", ***i)
+        cut_error!(
+            "the binary AND operator is called `bitand` in askama",
+            span,
+            i
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Filter<'a> {
     pub name: PathOrIdentifier<'a>,
-    pub arguments: Vec<WithSpan<'a, Box<Expr<'a>>>>,
+    pub arguments: Vec<WithSpan<Box<Expr<'a>>>>,
 }
 
 impl<'a> Filter<'a> {
@@ -782,15 +820,13 @@ impl<'a> Filter<'a> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssociatedItem<'a> {
     pub name: &'a str,
-    pub generics: Vec<WithSpan<'a, TyGenerics<'a>>>,
+    pub generics: Vec<WithSpan<TyGenerics<'a>>>,
 }
 
 enum Suffix<'a> {
     AssociatedItem(AssociatedItem<'a>),
-    Index(WithSpan<'a, Box<Expr<'a>>>),
-    Call {
-        args: Vec<WithSpan<'a, Box<Expr<'a>>>>,
-    },
+    Index(WithSpan<Box<Expr<'a>>>),
+    Call { args: Vec<WithSpan<Box<Expr<'a>>>> },
     // The value is the arguments of the macro call.
     MacroCall(&'a str),
     Try,
@@ -800,7 +836,7 @@ impl<'a> Suffix<'a> {
     fn parse(
         i: &mut InputStream<'a>,
         level: Level<'_>,
-    ) -> ParseResult<'a, WithSpan<'a, Box<Expr<'a>>>> {
+    ) -> ParseResult<'a, WithSpan<Box<Expr<'a>>>> {
         let i_start = ***i;
         let mut level_guard = level.guard();
         let mut expr = Expr::single(i, level)?;
@@ -843,7 +879,7 @@ impl<'a> Suffix<'a> {
                         }
                         expr = WithSpan::new(
                             Box::new(Expr::RustMacro(
-                                path.into_iter().map(|c| c.name).collect(),
+                                path.into_iter().map(|c: WithSpan<PathComponent<'_>>| c.name).collect(),
                                 args,
                             )),
                             start,
@@ -894,37 +930,43 @@ impl<'a> Suffix<'a> {
             i: &mut InputStream<'a>,
             open_token: Group,
         ) -> ParseResult<'a, Suffix<'a>> {
-            let start = ***i;
-            let mut open_list: Vec<Group> = vec![open_token];
-            loop {
-                let before = *i;
-                let (token, token_span) = ws(opt(token).with_taken()).parse_next(i)?;
-                let Some(token) = token else {
-                    return cut_error!("expected valid tokens in macro call", token_span);
-                };
-                let close_token = match token {
-                    Token::SomeOther => continue,
-                    Token::Open(group) => {
-                        open_list.push(group);
-                        continue;
-                    }
-                    Token::Close(close_token) => close_token,
-                };
-                let open_token = open_list.pop().unwrap();
+            fn inner<'a>(i: &mut InputStream<'a>, open_token: Group) -> ParseResult<'a, ()> {
+                let mut open_list: Vec<Group> = vec![open_token];
+                loop {
+                    let token = ws(opt(token.with_span())).parse_next(i)?;
+                    let Some((token, span)) = token else {
+                        return cut_error!("expected valid tokens in macro call", *i);
+                    };
+                    let close_token = match token {
+                        Token::SomeOther => continue,
+                        Token::Open(group) => {
+                            open_list.push(group);
+                            continue;
+                        }
+                        Token::Close(close_token) => close_token,
+                    };
+                    let open_token = open_list.pop().unwrap();
 
-                if open_token != close_token {
-                    return cut_error!(
-                        format!(
-                            "expected `{}` but found `{}`",
-                            open_token.as_close_char(),
-                            close_token.as_close_char(),
-                        ),
-                        token_span,
-                    );
-                } else if open_list.is_empty() {
-                    return Ok(Suffix::MacroCall(&start[..start.len() - before.len()]));
+                    if open_token != close_token {
+                        return cut_error!(
+                            format!(
+                                "expected `{}` but found `{}`",
+                                open_token.as_close_char(),
+                                close_token.as_close_char(),
+                            ),
+                            span,
+                            i,
+                        );
+                    } else if open_list.is_empty() {
+                        return Ok(());
+                    }
                 }
             }
+
+            (|i: &mut _| inner(i, open_token))
+                .take()
+                .map(Suffix::MacroCall)
+                .parse_next(i)
         }
 
         fn token<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, Token> {
@@ -974,13 +1016,13 @@ impl<'a> Suffix<'a> {
 
         fn block_comment<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, ()> {
             fn inner<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, bool> {
-                let start = "/*".parse_next(i)?;
                 let is_doc_comment = alt((
                     ('*', not(peek(one_of(['*', '/'])))).value(true),
                     '!'.value(true),
                     empty.value(false),
-                ))
-                .parse_next(i)?;
+                ));
+                let (is_doc_comment, start) =
+                    preceded("/*", is_doc_comment).with_span().parse_next(i)?;
 
                 let mut depth = 0usize;
                 loop {
@@ -991,6 +1033,7 @@ impl<'a> Suffix<'a> {
                                 if is_doc_comment { "doc " } else { "" }
                             ),
                             start,
+                            i,
                         );
                     } else if alt(("/*".value(true), "*/".value(false))).parse_next(i)? {
                         // cannot overflow: `i` cannot be longer than `isize::MAX`, cf. [std::alloc::Layout]
@@ -1009,12 +1052,15 @@ impl<'a> Suffix<'a> {
         fn identifier_or_prefixed_string<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, ()> {
             // <https://doc.rust-lang.org/reference/tokens.html#r-lex.token.literal.str-raw.syntax>
 
-            let prefix = identifier.parse_next(i)?;
-            let hashes: usize = repeat(.., '#').parse_next(i)?;
+            let ((prefix, hashes, quot), prefix_span): ((_, usize, _), _) =
+                (identifier, repeat(.., '#'), opt('"'))
+                    .with_span()
+                    .parse_next(i)?;
             if hashes >= 256 {
                 return cut_error!(
-                    "a maximum of 255 hashes `#` are allowed with raw strings",
-                    prefix,
+                    "a maximum of 255 hashes `#` are allowed with raw and prefixed strings",
+                    prefix_span,
+                    i,
                 );
             }
 
@@ -1035,14 +1081,13 @@ impl<'a> Suffix<'a> {
                 }
             };
 
-            if opt('"').parse_next(i)?.is_some() {
+            if quot.is_some() {
                 // got a raw string
 
                 let delim = format!("\"{:#<hashes$}", "");
-                let Some(inner) = opt(terminated(take_until(.., delim.as_str()), delim.as_str()))
-                    .parse_next(i)?
-                else {
-                    return cut_error!("unterminated raw string", prefix);
+                let p = terminated(take_until(.., delim.as_str()).with_span(), delim.as_str());
+                let Some((inner, inner_span)) = opt(p).parse_next(i)? else {
+                    return cut_error!("unterminated raw string", prefix_span, i);
                 };
 
                 if inner.split('\r').skip(1).any(|s| !s.starts_with('\n')) {
@@ -1052,7 +1097,8 @@ impl<'a> Suffix<'a> {
                             use NL (Unix linebreak) or CRNL (Windows linebreak) instead, \
                             or type `\\r` explicitly",
                         ),
-                        prefix,
+                        inner_span,
+                        i,
                     );
                 }
 
@@ -1068,7 +1114,7 @@ impl<'a> Suffix<'a> {
                     None => None,
                 };
                 if let Some(msg) = msg {
-                    return cut_error!(msg, prefix);
+                    return cut_error!(msg, prefix_span, i);
                 }
 
                 not_suffix_with_hash(i)?;
@@ -1076,7 +1122,7 @@ impl<'a> Suffix<'a> {
             } else if hashes == 0 {
                 // a simple identifier
                 Ok(())
-            } else if let Some(id) = opt(identifier).parse_next(i)? {
+            } else if let Some((id, span)) = opt(identifier.with_span()).parse_next(i)? {
                 // got a raw identifier
 
                 if str_kind.is_some() {
@@ -1086,18 +1132,24 @@ impl<'a> Suffix<'a> {
                             "reserved prefix `{}#`, only `r#` is allowed with raw identifiers",
                             prefix.escape_debug(),
                         ),
-                        prefix,
+                        prefix_span,
+                        i,
                     )
                 } else if hashes > 1 {
                     // an invalid raw identifier like `r##async`
                     cut_error!(
                         "only one `#` is allowed in raw identifier delimitation",
-                        prefix,
+                        prefix_span,
+                        i,
                     )
                 } else {
                     // a raw identifier like `r#async`
                     if !can_be_variable_name(id) {
-                        cut_error!(format!("`{id}` cannot be a raw identifier"), id)
+                        cut_error!(
+                            format!("`{}` cannot be a raw identifier", id.escape_debug()),
+                            span,
+                            i,
+                        )
                     } else {
                         Ok(())
                     }
@@ -1108,18 +1160,19 @@ impl<'a> Suffix<'a> {
                         "prefix `{}#` is only allowed with raw identifiers and raw strings",
                         prefix.escape_debug(),
                     ),
-                    prefix,
+                    prefix_span,
+                    i,
                 )
             }
         }
 
         fn hash<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, Token> {
-            let start = ***i;
-            '#'.parse_next(i)?;
-            if opt('"').parse_next(i)?.is_some() {
+            let (quot, span) = preceded('#', opt('"')).with_span().parse_next(i)?;
+            if quot.is_some() {
                 return cut_error!(
                     "unprefixed guarded string literals are reserved for future use",
-                    start,
+                    span,
+                    i,
                 );
             }
             Ok(Token::SomeOther)
@@ -1244,12 +1297,13 @@ fn doc_comment_no_bare_cr<'a>(
     i: &mut InputStream<'a>,
     inner: fn(i: &mut InputStream<'a>) -> ParseResult<'a, bool>,
 ) -> ParseResult<'a, ()> {
-    let (is_doc_comment, comment) = inner.with_taken().parse_next(i)?;
+    let ((is_doc_comment, comment), span) = inner.with_taken().with_span().parse_next(i)?;
     if is_doc_comment && comment.split('\r').skip(1).any(|s| !s.starts_with('\n')) {
         cut_error!(
             "bare CR not allowed in doc comment, 
             use NL (Unix linebreak) or CRNL (Windows linebreak) instead",
-            comment,
+            span,
+            i,
         )
     } else {
         Ok(())
@@ -1268,31 +1322,38 @@ fn ensure_macro_name(name: &str) -> ParseResult<'_, ()> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TyGenerics<'a> {
     pub refs: usize,
-    pub path: Vec<&'a str>,
-    pub args: Vec<WithSpan<'a, TyGenerics<'a>>>,
+    pub path: Vec<WithSpan<&'a str>>,
+    pub args: Vec<WithSpan<TyGenerics<'a>>>,
 }
 
 impl<'i> TyGenerics<'i> {
-    fn parse(i: &mut InputStream<'i>, level: Level<'_>) -> ParseResult<'i, WithSpan<'i, Self>> {
-        let start = ***i;
-        let (refs, path, args): (_, Vec<_>, _) = (
+    fn parse(i: &mut InputStream<'i>, level: Level<'_>) -> ParseResult<'i, WithSpan<Self>> {
+        let file_id: FileId = i.into();
+        let ((refs, path, args), span): ((_, Vec<WithSpan<_>>, _), _) = ws((
             repeat(0.., ws('&')),
-            separated(1.., ws(identifier), "::"),
+            separated(
+                1..,
+                ws(identifier
+                    .with_span()
+                    .map(|(name, span)| WithSpan::new(name, span, file_id))),
+                "::",
+            ),
             opt(|i: &mut _| Self::args(i, level)).map(|generics| generics.unwrap_or_default()),
-        )
-            .parse_next(i)?;
+        ))
+        .with_span()
+        .parse_next(i)?;
 
-        if let &[name] = path.as_slice() {
-            if matches!(name, "super" | "self" | "crate") {
+        if let [name] = path.as_slice() {
+            if matches!(**name, "super" | "self" | "crate") {
                 // `Self` and `_` are allowed
                 return err_reserved_identifier(name);
             }
         } else {
-            for (idx, &name) in path.iter().enumerate() {
-                if name == "_" {
+            for (idx, name) in path.iter().enumerate() {
+                if **name == "_" {
                     // `_` is never allowed
                     return err_underscore_identifier(name);
-                } else if idx > 0 && matches!(name, "super" | "self" | "Self" | "crate") {
+                } else if idx > 0 && matches!(**name, "super" | "self" | "Self" | "crate") {
                     // At the front of the path, "super" | "self" | "Self" | "crate" are allowed.
                     // Inside the path, they are not allowed.
                     return err_reserved_identifier(name);
@@ -1300,13 +1361,13 @@ impl<'i> TyGenerics<'i> {
             }
         }
 
-        Ok(WithSpan::new(TyGenerics { refs, path, args }, start, i))
+        Ok(WithSpan::new(TyGenerics { refs, path, args }, span, i))
     }
 
     fn args(
         i: &mut InputStream<'i>,
         level: Level<'_>,
-    ) -> ParseResult<'i, Vec<WithSpan<'i, TyGenerics<'i>>>> {
+    ) -> ParseResult<'i, Vec<WithSpan<TyGenerics<'i>>>> {
         ws('<').parse_next(i)?;
         let _level_guard = level.nest(i)?;
         cut_err(terminated(
@@ -1323,6 +1384,6 @@ impl<'i> TyGenerics<'i> {
 pub(crate) fn call_generics<'i>(
     i: &mut InputStream<'i>,
     level: Level<'_>,
-) -> ParseResult<'i, Vec<WithSpan<'i, TyGenerics<'i>>>> {
+) -> ParseResult<'i, Vec<WithSpan<TyGenerics<'i>>>> {
     preceded(ws("::"), cut_err(|i: &mut _| TyGenerics::args(i, level))).parse_next(i)
 }

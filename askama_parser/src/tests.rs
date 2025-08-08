@@ -2,20 +2,11 @@ use winnow::{LocatingSlice, Parser};
 
 use crate::node::{Lit, Raw, Whitespace, Ws};
 use crate::{
-    Ast, Expr, Filter, InnerSyntax, InputStream, Node, Num, PathComponent, PathOrIdentifier, Span,
+    Ast, Expr, Filter, InnerSyntax, InputStream, Node, Num, PathComponent, PathOrIdentifier,
     StrLit, Syntax, SyntaxBuilder, WithSpan,
 };
 
-impl<T> WithSpan<'static, T> {
-    fn no_span(inner: T) -> Self {
-        Self {
-            inner,
-            span: Span::default(),
-        }
-    }
-}
-
-fn as_path<'a>(path: &'a [&'a str]) -> Vec<WithSpan<'a, PathComponent<'a>>> {
+fn as_path<'a>(path: &'a [&'a str]) -> Vec<WithSpan<PathComponent<'a>>> {
     path.iter()
         .map(|name| {
             WithSpan::no_span(PathComponent {
@@ -48,23 +39,23 @@ fn test_invalid_block() {
     Ast::from_str("{% extend \"blah\" %}", None, &Syntax::default()).unwrap();
 }
 
-fn int_lit<'a>(i: &'a str) -> WithSpan<'a, Box<Expr<'a>>> {
-    WithSpan::new_without_span(Box::new(Expr::NumLit(i, Num::Int(i, None))))
+fn int_lit<'a>(i: &'a str) -> WithSpan<Box<Expr<'a>>> {
+    WithSpan::no_span(Box::new(Expr::NumLit(i, Num::Int(i, None))))
 }
 
 fn bin_op<'a>(
     op: &'a str,
-    lhs: WithSpan<'a, Box<Expr<'a>>>,
-    rhs: WithSpan<'a, Box<Expr<'a>>>,
-) -> WithSpan<'a, Box<Expr<'a>>> {
-    WithSpan::new_without_span(Box::new(Expr::BinOp(crate::expr::BinOp { op, lhs, rhs })))
+    lhs: WithSpan<Box<Expr<'a>>>,
+    rhs: WithSpan<Box<Expr<'a>>>,
+) -> WithSpan<Box<Expr<'a>>> {
+    WithSpan::no_span(Box::new(Expr::BinOp(crate::expr::BinOp { op, lhs, rhs })))
 }
 
 fn call<'a>(
-    path: WithSpan<'a, Box<Expr<'a>>>,
-    args: Vec<WithSpan<'a, Box<Expr<'a>>>>,
-) -> WithSpan<'a, Box<Expr<'a>>> {
-    WithSpan::new_without_span(Box::new(Expr::Call(crate::expr::Call { path, args })))
+    path: WithSpan<Box<Expr<'a>>>,
+    args: Vec<WithSpan<Box<Expr<'a>>>>,
+) -> WithSpan<Box<Expr<'a>>> {
+    WithSpan::no_span(Box::new(Expr::Call(crate::expr::Call { path, args })))
 }
 
 #[test]
@@ -1351,7 +1342,7 @@ fn test_filter_with_path() {
 fn underscore_is_an_identifier() {
     let mut input = InputStream {
         input: LocatingSlice::new("_"),
-        state: (),
+        state: crate::FileId(()),
     };
     let result = crate::identifier.parse_next(&mut input);
     assert_eq!(result.unwrap(), "_");

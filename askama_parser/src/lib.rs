@@ -13,10 +13,10 @@ mod tests;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::env::current_dir;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Range};
 use std::path::Path;
 use std::sync::Arc;
-use std::{fmt, str};
+use std::{fmt, str, usize};
 
 use rustc_hash::FxBuildHasher;
 use winnow::ascii::take_escaped;
@@ -24,7 +24,7 @@ use winnow::combinator::{
     alt, cond, cut_err, delimited, empty, fail, not, opt, peek, preceded, repeat, terminated,
 };
 use winnow::error::ErrMode;
-use winnow::stream::AsChar;
+use winnow::stream::{AsChar, Location, Stream};
 use winnow::token::{any, none_of, one_of, take_while};
 use winnow::{LocatingSlice, ModalParser, ModalResult, Parser, Stateful};
 
@@ -102,7 +102,22 @@ mod _parsed {
 
 pub use _parsed::Parsed;
 
-type InputStream<'a> = Stateful<LocatingSlice<&'a str>, ()>;
+type InputStream<'a> = Stateful<LocatingSlice<&'a str>, FileId>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileId(pub ());
+
+impl From<&InputStream<'_>> for FileId {
+    fn from(value: &InputStream<'_>) -> Self {
+        value.state
+    }
+}
+
+impl From<&mut InputStream<'_>> for FileId {
+    fn from(value: &mut InputStream<'_>) -> Self {
+        value.state
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Ast<'a> {
@@ -117,7 +132,6 @@ impl<'a> Ast<'a> {
         file_path: Option<Arc<Path>>,
         syntax: &Syntax<'_>,
     ) -> Result<Self, ParseError> {
-        let start = src;
         let level = Cell::new(Level::MAX_DEPTH);
         let state = State {
             syntax,
@@ -126,7 +140,7 @@ impl<'a> Ast<'a> {
         };
         let mut src = InputStream {
             input: LocatingSlice::new(src),
-            state: (),
+            state: FileId(()),
         };
         match Node::parse_template(&mut src, &state) {
             Ok(nodes) if src.is_empty() => Ok(Self { nodes }),
@@ -136,7 +150,7 @@ impl<'a> Ast<'a> {
                 | ErrMode::Cut(ErrorContext { span, message, .. }),
             ) => Err(ParseError {
                 message,
-                offset: span.offset_from(start).unwrap_or_default(),
+                offset: span.start,
                 file_path,
             }),
         }
@@ -150,100 +164,99 @@ impl<'a> Ast<'a> {
 
 /// Struct used to wrap types with their associated "span" which is used when generating errors
 /// in the code generation.
-#[repr(C)] // rationale: `WithSpan<'_, Box<T>` needs to have the same layout as `WithSpan<'_, &T>`.
-pub struct WithSpan<'a, T> {
+#[repr(C)] // rationale: `WithSpan<Box<T>` needs to have the same layout as `WithSpan<&T>`.
+pub struct WithSpan<T> {
     inner: T,
-    span: Span<'a>,
+    span: Span,
 }
 
 /// A location in `&'a str`
 #[derive(Debug, Clone, Copy)]
-pub struct Span<'a>(&'a str);
+pub struct Span {
+    start: usize,
+    end: usize,
+    file: FileId,
+}
 
-impl Default for Span<'static> {
+impl From<&InputStream<'_>> for Span {
     #[inline]
-    fn default() -> Self {
-        Self::empty()
+    fn from(i: &InputStream<'_>) -> Self {
+        (*i).into()
     }
 }
 
-impl<'a> Span<'a> {
+impl From<InputStream<'_>> for Span {
     #[inline]
-    pub const fn empty() -> Self {
-        Self("")
-    }
-
-    pub fn offset_from(self, start: &'a str) -> Option<usize> {
-        let start_range = start.as_bytes().as_ptr_range();
-        let this_ptr = self.0.as_ptr();
-        match start_range.contains(&this_ptr) {
-            // SAFETY: we just checked that `this_ptr` is inside `start_range`
-            true => Some(unsafe { this_ptr.offset_from(start_range.start) as usize }),
-            false => None,
-        }
-    }
-
-    pub fn as_suffix_of(self, start: &'a str) -> Option<&'a str> {
-        let offset = self.offset_from(start)?;
-        match start.is_char_boundary(offset) {
-            true => Some(&start[offset..]),
-            false => None,
-        }
-    }
-
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        self.0.len()
+    fn from(mut i: InputStream<'_>) -> Self {
+        let start = i.current_token_start();
+        i.finish();
+        let end = i.current_token_start();
+        let file = i.state;
+        Self { start, end, file }
     }
 }
 
-impl<'a> From<&'a str> for Span<'a> {
+impl From<(Range<usize>, &InputStream<'_>)> for Span {
     #[inline]
-    fn from(value: &'a str) -> Self {
-        Self(value)
+    fn from((range, stream): (Range<usize>, &InputStream<'_>)) -> Self {
+        Span::new(range, stream)
     }
 }
 
-impl<'a, T> WithSpan<'a, T> {
+impl Span {
     #[inline]
-    pub fn new(inner: T, span_begin: &'a str, span_end: &'a str) -> Self {
-        assert!(span_begin.len() >= span_end.len());
-        let len = span_begin.len() - span_end.len();
-        Self {
-            inner,
-            span: Span(&span_begin[..len]),
+    pub fn new(range: Range<usize>, stream: impl Into<FileId>) -> Self {
+        Span {
+            start: range.start,
+            end: range.end,
+            file: stream.into(),
         }
     }
 
     #[inline]
-    pub fn new_with_full<I: Into<Span<'a>>>(inner: T, span: I) -> Self {
+    pub fn byte_range(&self) -> Option<Range<usize>> {
+        (self.start != usize::MAX).then_some(self.start..self.end)
+    }
+}
+
+impl<T> WithSpan<T> {
+    #[inline]
+    pub fn new(inner: T, range: Range<usize>, stream: impl Into<FileId>) -> Self {
         Self {
             inner,
-            span: span.into(),
+            span: Span {
+                start: range.start,
+                end: range.end,
+                file: stream.into(),
+            },
         }
     }
 
     #[inline]
-    pub const fn new_without_span(inner: T) -> Self {
+    pub const fn no_span(inner: T) -> Self {
         Self {
             inner,
-            span: Span::empty(),
+            span: Span {
+                start: usize::MAX,
+                end: usize::MAX,
+                file: FileId(()),
+            },
         }
     }
 
     #[inline]
-    pub fn span(&self) -> Span<'a> {
+    pub fn span(&self) -> Span {
         self.span
     }
 
     #[inline]
-    pub fn deconstruct(self) -> (T, Span<'a>) {
+    pub fn deconstruct(self) -> (T, Span) {
         let Self { inner, span } = self;
         (inner, span)
     }
 }
 
-impl<T> Deref for WithSpan<'_, T> {
+impl<T> Deref for WithSpan<T> {
     type Target = T;
 
     #[inline]
@@ -252,19 +265,19 @@ impl<T> Deref for WithSpan<'_, T> {
     }
 }
 
-impl<T> DerefMut for WithSpan<'_, T> {
+impl<T> DerefMut for WithSpan<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for WithSpan<'_, T> {
+impl<T: fmt::Debug> fmt::Debug for WithSpan<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.inner)
     }
 }
 
-impl<T: Clone> Clone for WithSpan<'_, T> {
+impl<T: Clone> Clone for WithSpan<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -273,7 +286,7 @@ impl<T: Clone> Clone for WithSpan<'_, T> {
     }
 }
 
-impl<T: PartialEq> PartialEq for WithSpan<'_, T> {
+impl<T: PartialEq> PartialEq for WithSpan<T> {
     fn eq(&self, other: &Self) -> bool {
         // We never want to compare the span information.
         self.inner == other.inner
@@ -311,7 +324,7 @@ impl fmt::Display for ParseError {
     }
 }
 
-pub(crate) type ParseErr<'a> = ErrMode<ErrorContext<'a>>;
+pub(crate) type ParseErr<'a> = ErrMode<ErrorContext>;
 pub(crate) type ParseResult<'a, T = &'a str> = Result<T, ParseErr<'a>>;
 
 /// This type is used to handle `nom` errors and in particular to add custom error messages.
@@ -320,14 +333,14 @@ pub(crate) type ParseResult<'a, T = &'a str> = Result<T, ParseErr<'a>>;
 /// It cannot be used to replace `ParseError` because it expects a generic, which would make
 /// `askama`'s users experience less good (since this generic is only needed for `nom`).
 #[derive(Debug)]
-pub(crate) struct ErrorContext<'a> {
-    pub(crate) span: Span<'a>,
+pub(crate) struct ErrorContext {
+    pub(crate) span: Span,
     pub(crate) message: Option<Cow<'static, str>>,
 }
 
-impl<'a> ErrorContext<'a> {
+impl ErrorContext {
     #[cold]
-    fn unclosed(kind: &str, tag: &str, span: impl Into<Span<'a>>) -> Self {
+    fn unclosed(kind: &str, tag: &str, span: impl Into<Span>) -> Self {
         Self {
             span: span.into(),
             message: Some(format!("unclosed {kind}, missing {tag:?}").into()),
@@ -336,7 +349,7 @@ impl<'a> ErrorContext<'a> {
 
     #[cold]
     #[inline]
-    fn new(message: impl Into<Cow<'static, str>>, span: impl Into<Span<'a>>) -> Self {
+    fn new(message: impl Into<Cow<'static, str>>, span: impl Into<Span>) -> Self {
         Self {
             span: span.into(),
             message: Some(message.into()),
@@ -354,13 +367,13 @@ impl<'a> ErrorContext<'a> {
     }
 }
 
-impl<'a> winnow::error::ParserError<InputStream<'a>> for ErrorContext<'a> {
+impl<'a> winnow::error::ParserError<InputStream<'a>> for ErrorContext {
     type Inner = Self;
 
     #[inline]
     fn from_input(input: &InputStream<'a>) -> Self {
         Self {
-            span: Span(***input),
+            span: input.into(),
             message: None,
         }
     }
@@ -384,12 +397,12 @@ fn skip_ws1<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, ()> {
 }
 
 fn ws<'a, O>(
-    inner: impl ModalParser<InputStream<'a>, O, ErrorContext<'a>>,
-) -> impl ModalParser<InputStream<'a>, O, ErrorContext<'a>> {
+    inner: impl ModalParser<InputStream<'a>, O, ErrorContext>,
+) -> impl ModalParser<InputStream<'a>, O, ErrorContext> {
     delimited(skip_ws0, inner, skip_ws0)
 }
 
-fn keyword<'a>(k: &str) -> impl ModalParser<InputStream<'a>, &'a str, ErrorContext<'a>> {
+fn keyword<'a>(k: &str) -> impl ModalParser<InputStream<'a>, &'a str, ErrorContext> {
     identifier.verify(move |v: &str| v == k)
 }
 
@@ -413,10 +426,9 @@ fn num_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, Num<'a>> {
     fn num_lit_suffix<'a, T: Copy>(
         kind: &'a str,
         list: &[(&str, T)],
-        start: &'a str,
         i: &mut InputStream<'a>,
     ) -> ParseResult<'a, T> {
-        let suffix = identifier.parse_next(i)?;
+        let (suffix, span) = identifier.with_span().parse_next(i)?;
         if let Some(value) = list
             .iter()
             .copied()
@@ -424,20 +436,19 @@ fn num_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, Num<'a>> {
         {
             Ok(value)
         } else {
-            cut_error!(format!("unknown {kind} suffix `{suffix}`"), start)
+            cut_error!(format!("unknown {kind} suffix `{suffix}`"), span, i)
         }
     }
 
-    let start = ***i;
-
     // Equivalent to <https://github.com/rust-lang/rust/blob/e3f909b2bbd0b10db6f164d466db237c582d3045/compiler/rustc_lexer/src/lib.rs#L587-L620>.
     let int_with_base = (opt('-'), |i: &mut _| {
-        let (base, kind) = preceded('0', alt(('b'.value(2), 'o'.value(8), 'x'.value(16))))
+        let ((base, kind), span) = preceded('0', alt(('b'.value(2), 'o'.value(8), 'x'.value(16))))
             .with_taken()
+            .with_span()
             .parse_next(i)?;
         match opt(separated_digits(base, false)).parse_next(i)? {
             Some(_) => Ok(()),
-            None => cut_error!(format!("expected digits after `{kind}`"), start),
+            None => cut_error!(format!("expected digits after `{kind}`"), span, i),
         }
     });
 
@@ -446,13 +457,16 @@ fn num_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, Num<'a>> {
     let float = |i: &mut InputStream<'a>| -> ParseResult<'a, ()> {
         let has_dot = opt(('.', separated_digits(10, true))).parse_next(i)?;
         let has_exp = opt(|i: &mut _| {
-            let (kind, op) = (one_of(['e', 'E']), opt(one_of(['+', '-']))).parse_next(i)?;
+            let ((kind, op), span) = (one_of(['e', 'E']), opt(one_of(['+', '-'])))
+                .with_span()
+                .parse_next(i)?;
             match opt(separated_digits(10, op.is_none())).parse_next(i)? {
                 Some(_) => Ok(()),
                 None => {
                     cut_error!(
                         format!("expected decimal digits, `+` or `-` after exponent `{kind}`"),
-                        start,
+                        span,
+                        i
                     )
                 }
             }
@@ -465,20 +479,17 @@ fn num_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, Num<'a>> {
     };
 
     let num = if let Some(num) = opt(int_with_base.take()).parse_next(i)? {
-        let suffix =
-            opt(|i: &mut _| num_lit_suffix("integer", INTEGER_TYPES, start, i)).parse_next(i)?;
+        let suffix = opt(|i: &mut _| num_lit_suffix("integer", INTEGER_TYPES, i)).parse_next(i)?;
         Num::Int(num, suffix)
     } else {
         let (float, num) = preceded((opt('-'), separated_digits(10, true)), opt(float))
             .with_taken()
             .parse_next(i)?;
         if float.is_some() {
-            let suffix =
-                opt(|i: &mut _| num_lit_suffix("float", FLOAT_TYPES, start, i)).parse_next(i)?;
+            let suffix = opt(|i: &mut _| num_lit_suffix("float", FLOAT_TYPES, i)).parse_next(i)?;
             Num::Float(num, suffix)
         } else {
-            let suffix =
-                opt(|i: &mut _| num_lit_suffix("number", NUM_TYPES, start, i)).parse_next(i)?;
+            let suffix = opt(|i: &mut _| num_lit_suffix("number", NUM_TYPES, i)).parse_next(i)?;
             match suffix {
                 Some(NumKind::Int(kind)) => Num::Int(num, Some(kind)),
                 Some(NumKind::Float(kind)) => Num::Float(num, Some(kind)),
@@ -494,7 +505,7 @@ fn num_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, Num<'a>> {
 fn separated_digits<'a>(
     radix: u32,
     start: bool,
-) -> impl ModalParser<InputStream<'a>, &'a str, ErrorContext<'a>> {
+) -> impl ModalParser<InputStream<'a>, &'a str, ErrorContext> {
     (
         cond(!start, repeat(0.., '_').map(|()| ())),
         one_of(move |ch: char| ch.is_digit(radix)),
@@ -551,15 +562,15 @@ fn str_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, StrLit<'a>> {
     // <https://doc.rust-lang.org/reference/tokens.html#r-lex.token.literal.str.syntax>
 
     fn inner<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, StrLit<'a>> {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, PartialEq, Eq)]
         enum Sequence<'a> {
             Text(&'a str),
             Close,
             Escape,
-            Cr(bool),
+            CrLf,
+            Cr(Range<usize>),
         }
 
-        let start = ***i;
         let mut contains_null = false;
         let mut contains_unicode_character = false;
         let mut contains_unicode_escape = false;
@@ -570,7 +581,10 @@ fn str_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, StrLit<'a>> {
                 repeat::<_, _, (), _, _>(1.., none_of(['\r', '\\', '"']))
                     .take()
                     .map(Sequence::Text),
-                preceded('\r', opt('\n')).map(|c| Sequence::Cr(c.is_some())),
+                ('\r'.span(), opt('\n')).map(|(span, has_lf)| match has_lf {
+                    Some(_) => Sequence::CrLf,
+                    None => Sequence::Cr(span),
+                }),
                 '\\'.value(Sequence::Escape),
                 peek('"').value(Sequence::Close),
             ))
@@ -583,17 +597,15 @@ fn str_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, StrLit<'a>> {
                     contains_null = contains_null || s.bytes().any(|c: u8| c == 0);
                     continue;
                 }
-                Sequence::Cr(has_lf) => {
-                    if has_lf {
-                        continue;
-                    } else {
-                        return cut_error!(
-                            "a bare CR (Mac linebreak) is not allowed in string literals, \
-                            use NL (Unix linebreak) or CRNL (Windows linebreak) instead, \
-                            or type `\\r` explicitly",
-                            start,
-                        );
-                    }
+                Sequence::CrLf => continue,
+                Sequence::Cr(span) => {
+                    return cut_error!(
+                        "a bare CR (Mac linebreak) is not allowed in string literals, \
+                        use NL (Unix linebreak) or CRNL (Windows linebreak) instead, \
+                        or type `\\r` explicitly",
+                        span,
+                        i,
+                    );
                 }
                 Sequence::Close => break,
                 Sequence::Escape => {}
@@ -615,15 +627,16 @@ fn str_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, StrLit<'a>> {
                 }
                 'u' => {
                     contains_unicode_escape = true;
-                    let code = delimited('{', take_while(1..=6, AsChar::is_hex_digit), '}')
+                    let (code, span) = delimited('{', take_while(1..=6, AsChar::is_hex_digit), '}')
+                        .with_span()
                         .parse_next(i)?;
                     match u32::from_str_radix(code, 16).unwrap() {
                         0 => contains_null = true,
                         0xd800..0xe000 => {
-                            return cut_error!("unicode escape must not be a surrogate", start);
+                            return cut_error!("unicode escape must not be a surrogate", span, i);
                         }
                         0x110000.. => {
-                            return cut_error!("unicode escape must be at most 10FFFF", start);
+                            return cut_error!("unicode escape must be at most 10FFFF", span, i);
                         }
                         128.. => contains_unicode_character = true,
                         _ => {}
@@ -643,20 +656,21 @@ fn str_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, StrLit<'a>> {
         })
     }
 
-    let start = ***i;
-
-    let prefix = terminated(
-        opt(alt((
-            'b'.value(StrPrefix::Binary),
-            'c'.value(StrPrefix::CLike),
-        ))),
-        '"',
+    let ((prefix, lit), span) = (
+        terminated(
+            opt(alt((
+                'b'.value(StrPrefix::Binary),
+                'c'.value(StrPrefix::CLike),
+            ))),
+            '"',
+        ),
+        opt(terminated(inner.with_taken(), '"')),
     )
-    .parse_next(i)?;
+        .with_span()
+        .parse_next(i)?;
 
-    let lit = opt(terminated(inner.with_taken(), '"')).parse_next(i)?;
     let Some((mut lit, content)) = lit else {
-        return cut_error!("unclosed or broken string", start);
+        return cut_error!("unclosed or broken string", span, i);
     };
     lit.content = content;
     lit.prefix = prefix;
@@ -677,7 +691,7 @@ fn str_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, StrLit<'a>> {
         None => lit.contains_high_ascii.then_some("out of range hex escape"),
     };
     if let Some(msg) = msg {
-        return cut_error!(msg, start);
+        return cut_error!(msg, span, i);
     }
 
     not_suffix_with_hash(i)?;
@@ -685,18 +699,18 @@ fn str_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, StrLit<'a>> {
 }
 
 fn not_suffix_with_hash<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, ()> {
-    if let Some(suffix) = opt(identifier.take()).parse_next(i)? {
+    if let Some(span) = opt(identifier.span()).parse_next(i)? {
         return cut_error!(
             "you are missing a space to separate two string literals",
-            suffix,
+            span,
+            i,
         );
     }
     Ok(())
 }
 
 fn str_lit_without_prefix<'a>(i: &mut InputStream<'a>) -> ParseResult<'a> {
-    let start = ***i;
-    let lit = str_lit.parse_next(i)?;
+    let (lit, span) = str_lit.with_span().parse_next(i)?;
 
     let kind = match lit.prefix {
         Some(StrPrefix::Binary) => Some("binary slice"),
@@ -706,7 +720,8 @@ fn str_lit_without_prefix<'a>(i: &mut InputStream<'a>) -> ParseResult<'a> {
     if let Some(kind) = kind {
         return cut_error!(
             format!("expected an unprefixed normal string, not a {kind}"),
-            start,
+            span,
+            i,
         );
     }
 
@@ -733,7 +748,7 @@ fn char_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, CharLit<'a>> {
         opt(take_escaped(none_of(['\\', '\'']), '\\', any)),
         opt('\''),
     )
-        .with_taken()
+        .with_span()
         .parse_next(i)?;
 
     if is_closed.is_none() {
@@ -743,6 +758,7 @@ fn char_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, CharLit<'a>> {
                     CharPrefix::Binary => "unterminated byte literal",
                 },
                 span,
+                i,
             );
         } else {
             return fail(i);
@@ -757,6 +773,7 @@ fn char_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, CharLit<'a>> {
                     None => "empty character literal",
                 },
                 span,
+                i,
             );
         }
         content => content,
@@ -764,7 +781,7 @@ fn char_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, CharLit<'a>> {
 
     let mut content_i = content;
     let Ok(c) = Char::parse(&mut content_i) else {
-        return cut_error!("invalid character", span);
+        return cut_error!("invalid character", span, i);
     };
     if !content_i.is_empty() {
         let (c, s) = match prefix {
@@ -779,7 +796,8 @@ fn char_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, CharLit<'a>> {
                     None => "",
                 }
             ),
-            span
+            span,
+            i,
         );
     }
 
@@ -800,6 +818,7 @@ fn char_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, CharLit<'a>> {
                     return cut_error!(
                         "cannot use unicode escape in byte string in byte literal",
                         span,
+                        i,
                     );
                 }
                 None => (
@@ -814,10 +833,10 @@ fn char_lit<'a>(i: &mut InputStream<'a>) -> ParseResult<'a, CharLit<'a>> {
     };
 
     let Ok(nb) = u32::from_str_radix(nb, 16) else {
-        return cut_error!(err1, span);
+        return cut_error!(err1, span, i);
     };
     if nb > max_value {
-        return cut_error!(err2, span);
+        return cut_error!(err2, span, i);
     }
 
     Ok(CharLit { prefix, content })
@@ -866,7 +885,7 @@ impl<'a> Char<'a> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PathOrIdentifier<'a> {
-    Path(Vec<WithSpan<'a, PathComponent<'a>>>),
+    Path(Vec<WithSpan<PathComponent<'a>>>),
     Identifier(&'a str),
 }
 
@@ -874,17 +893,20 @@ fn path_or_identifier<'a>(
     i: &mut InputStream<'a>,
     level: Level<'_>,
 ) -> ParseResult<'a, PathOrIdentifier<'a>> {
-    let start_i = ***i;
-    let root = ws(opt("::"));
-    let tail = opt(repeat(
-        1..,
-        preceded(ws("::"), move |i: &mut _| PathComponent::parse(i, level)),
-    )
-    .map(|v: Vec<_>| v));
+    let ((root, start, rest), span) = (|i: &mut _| {
+        let root = ws(opt("::"));
+        let start = move |i: &mut _| PathComponent::parse(i, level);
+        let tail = opt(repeat(
+            1..,
+            preceded(ws("::"), move |i: &mut _| PathComponent::parse(i, level)),
+        )
+        .map(|v: Vec<_>| v));
 
-    let (root, start, rest) =
-        (root, move |i: &mut _| PathComponent::parse(i, level), tail).parse_next(i)?;
-    let rest = rest.unwrap_or_default();
+        let (root, start, rest) = (root, start, tail).parse_next(i)?;
+        Ok((root, start, rest.unwrap_or_default()))
+    })
+    .with_span()
+    .parse_next(i)?;
 
     // The returned identifier can be assumed to be path if:
     // - it is an absolute path (starts with `::`), or
@@ -910,7 +932,7 @@ fn path_or_identifier<'a>(
                         name: "",
                         generics: Vec::new(),
                     },
-                    start_i,
+                    span,
                     i,
                 ));
                 path
@@ -936,25 +958,27 @@ impl State<'_, '_> {
     }
 
     fn tag_block_end<'i>(&self, i: &mut InputStream<'i>) -> ParseResult<'i, ()> {
-        let control = alt((
+        let (control, span) = alt((
             self.syntax.block_end.value(None),
             peek(delimited('%', alt(('-', '~', '+')).map(Some), '}')),
             fail, // rollback on partial matches in the previous line
         ))
+        .with_span()
         .parse_next(i)?;
-        if let Some(control) = control {
-            let err = ErrorContext::new(
-                format!(
-                    "unclosed block, you likely meant to apply whitespace control: \"{}{}\"",
-                    control.escape_default(),
-                    self.syntax.block_end.escape_default(),
-                ),
-                ***i,
-            );
-            Err(err.backtrack())
-        } else {
-            Ok(())
-        }
+
+        let Some(control) = control else {
+            return Ok(());
+        };
+
+        let err = ErrorContext::new(
+            format!(
+                "unclosed block, you likely meant to apply whitespace control: \"{}{}\"",
+                control.escape_default(),
+                self.syntax.block_end.escape_default(),
+            ),
+            (span, &*i),
+        );
+        Err(err.backtrack())
     }
 
     fn tag_comment_start<'i>(&self, i: &mut InputStream<'i>) -> ParseResult<'i, ()> {
@@ -1161,7 +1185,7 @@ impl Level<'_> {
 
     /// Decrement the remaining level counter, and return a [`LevelGuard`] that increments it again
     /// when it's dropped.
-    fn nest<'a>(&self, i: &'a str) -> ParseResult<'a, LevelGuard<'_>> {
+    fn nest<'a>(&self, i: &InputStream<'a>) -> ParseResult<'a, LevelGuard<'_>> {
         if let Some(new_level) = self.0.get().checked_sub(1) {
             self.0.set(new_level);
             Ok(LevelGuard {
@@ -1173,12 +1197,11 @@ impl Level<'_> {
         }
     }
 
-    #[inline(always)]
-    fn _fail<T>(i: &str) -> ParseResult<'_, T> {
-        cut_error!(
-            "your template code is too deeply nested, or the last expression is too complex",
-            i,
-        )
+    #[cold]
+    #[inline(never)]
+    fn _fail<'a, T>(i: &InputStream<'a>) -> ParseResult<'a, T> {
+        let msg = "your template code is too deeply nested, or the last expression is too complex";
+        Err(ErrorContext::new(msg, i).cut())
     }
 }
 
@@ -1198,7 +1221,7 @@ impl Drop for LevelGuard<'_> {
 
 impl LevelGuard<'_> {
     /// Used to decrement the level multiple times, e.g. for every iteration of a loop.
-    fn nest<'a>(&mut self, i: &'a str) -> ParseResult<'a, ()> {
+    fn nest<'a>(&mut self, i: &InputStream<'a>) -> ParseResult<'a, ()> {
         if let Some(new_level) = self.level.0.get().checked_sub(1) {
             self.level.0.set(new_level);
             self.count += 1;
@@ -1445,16 +1468,38 @@ pub fn is_rust_keyword(ident: &str) -> bool {
 }
 
 macro_rules! cut_error {
+    ($message:expr, $range:expr, $stream:expr $(,)?) => {{
+        use ::std::convert::Into;
+        use $crate::Span;
+
+        let span: Span = Into::into(($range, &*$stream));
+        $crate::cut_error!($message, span)
+    }};
+
+    ($message:literal, $span:expr $(,)?) => {{
+        use ::std::convert::Into;
+        use ::std::primitive::str;
+        use ::std::result::Result::Err;
+        use ::winnow::error::ErrMode;
+        use $crate::{ErrorContext, Span};
+
+        let message: &'static str = $message;
+        let span: Span = Into::into($span);
+        Err(ErrMode::Cut(ErrorContext::new(message, span)))
+    }};
+
     ($message:expr, $span:expr $(,)?) => {{
         use ::std::convert::Into;
         use ::std::option::Option::Some;
+        use $crate::{ErrorContext, Span};
 
+        let span: Span = Into::into($span);
         $crate::cut_context_err(
             #[cold]
             #[inline(always)]
-            move || $crate::ErrorContext {
-                span: Into::into($span),
-                message: Some(Into::into($message)),
+            move || {
+                let message = Some(Into::into($message));
+                ErrorContext { span, message }
             },
         )
     }};
@@ -1464,7 +1509,7 @@ pub(crate) use cut_error;
 
 #[cold]
 #[inline(never)]
-fn cut_context_err<'a, T>(gen_err: impl FnOnce() -> ErrorContext<'a>) -> ParseResult<'a, T> {
+fn cut_context_err<'a, T>(gen_err: impl FnOnce() -> ErrorContext) -> ParseResult<'a, T> {
     Err(ErrMode::Cut(gen_err()))
 }
 
@@ -1504,12 +1549,12 @@ mod test {
     }
 
     fn parse_peek<'a, T>(
-        mut parser: impl ModalParser<InputStream<'a>, T, ErrorContext<'a>>,
+        mut parser: impl ModalParser<InputStream<'a>, T, ErrorContext>,
         input: &'a str,
     ) -> ParseResult<'a, (&'a str, T)> {
         let mut i = InputStream {
             input: LocatingSlice::new(input),
-            state: (),
+            state: FileId(()),
         };
         let value = parser.parse_next(&mut i)?;
         Ok((**i, value))
@@ -1673,14 +1718,6 @@ mod test {
             )
         );
         assert!(parse_peek(str_lit, r#"d"hello""#).is_err());
-    }
-
-    #[test]
-    fn assert_span_size() {
-        assert_eq!(
-            std::mem::size_of::<Span<'static>>(),
-            std::mem::size_of::<*const ()>() * 2,
-        );
     }
 
     #[test]
